@@ -174,8 +174,7 @@ class CrackMultiClassDataset(Dataset):
             raise FileNotFoundError(f"Не удалось прочитать mask из строки {idx}")
 
         img = cv2.resize(img, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
-        img = img.astype(np.float32) / 255.0
-        img = (img - 0.5) / 0.5  # [-1, 1]
+        img = img.astype(np.float32) / 255.0  # нормировка в [0, 1] (см. раздел 5.2)
 
         img = torch.from_numpy(img).permute(2, 0, 1).contiguous()
         label = torch.tensor(self.ratio_to_class(float((mask > 0).mean())), dtype=torch.long)
@@ -185,19 +184,20 @@ class CrackMultiClassDataset(Dataset):
 
 class ConvBlock(nn.Module):
     """
-    Один свёрточный блок.
-    Conv2d -> GroupNorm -> SiLU -> MaxPool2d -> Dropout2d
+    Один свёрточный блок:
+    Conv2d(3x3, padding=1) -> BatchNorm2d -> LeakyReLU(0.01) -> MaxPool2d(2) -> Dropout2d(0.25)
+
+    Свёртка с дополнением сохраняет пространственный размер, MaxPool уменьшает его вдвое.
     """
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        groups = 8 if out_ch >= 8 else 1
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(groups, out_ch),
-            nn.SiLU(inplace=True),
+            nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.MaxPool2d(kernel_size=2),
-            nn.Dropout2d(p=0.10),
+            nn.Dropout2d(p=0.25),
         )
 
     def forward(self, x):
@@ -206,89 +206,55 @@ class ConvBlock(nn.Module):
 
 class CrackClassifier(nn.Module):
     """
-    Классический CNN-классификатор.
-    Ровно один свёрточный блок.
+    Классический CNN-классификатор (единая архитектура для обоих наборов данных).
+
+    Свёрточная часть: три блока ConvBlock с ростом числа каналов 32 -> 64 -> 128.
+    Затем адаптивная подвыборка усреднением до 6x6, что даёт вектор 128*6*6 = 4608.
+
+    Полносвязная часть последовательно понижает размерность:
+        4608 -> 256 -> 64 -> 16 -> num_classes
+    Каждый промежуточный слой: Linear -> BatchNorm1d -> LeakyReLU -> Dropout.
+    Доля Dropout: 0.5 в первых двух слоях, 0.2 в последних.
+
+    Завершающий слой переводит 16-мерное представление в логиты по числу классов.
+    В гибридной модели именно этот финальный слой (вход 16 признаков) заменяется
+    квантовым компонентом (подход 1: 2 кубита по 8 признаков).
     """
 
-    def __init__(self):
+    def __init__(self, in_channels: int = 3, num_classes: int = 5):
         super().__init__()
-        # self.qnn = TorchConnector(qnn)
-        # ===== Свёрточные блоки =====
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.bn1   = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn2   = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.bn3   = nn.BatchNorm2d(128)
+        self.features = nn.Sequential(
+            ConvBlock(in_channels, 32),
+            ConvBlock(32, 64),
+            ConvBlock(64, 128),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((6, 6))  # 128 x 6 x 6 = 4608
 
-        self.pool     = nn.MaxPool2d(2, 2)
-        self.act      = nn.LeakyReLU(0.01)
-        self.drop_conv = nn.Dropout(0.25)
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(4608, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Dropout(p=0.5),
 
-        # Адаптивный пул чтобы получить (128 × 6 × 6)
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
+            nn.Linear(256, 64),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Dropout(p=0.5),
 
-        # ===== Полносвязная часть с двумя дополнительными слоями =====
-        # После adaptive_pool размер входа: 128 * 6 * 6 = 4608
-        self.fc1     = nn.Linear(128 * 6 * 6, 256)
-        self.bn_fc1  = nn.BatchNorm1d(256)
-        self.drop_fc1 = nn.Dropout(0.5)
-
-        self.fc2     = nn.Linear(256, 64)
-        self.bn_fc2  = nn.BatchNorm1d(64)
-        self.drop_fc2 = nn.Dropout(0.5)
-
-        # Добавляем два новых слоя:
-        # - сначала сжимаем 64 → 16
-        # - затем 16 → 4
-        self.fc3     = nn.Linear(64, 16)
-        self.bn_fc3  = nn.BatchNorm1d(16)
-        self.drop_fc3 = nn.Dropout(0.2)
-
-        self.fc4     = nn.Linear(16, 4)
-        self.bn_fc4  = nn.BatchNorm1d(4)
-        self.drop_fc4 = nn.Dropout(0.2)
-
-        # Финальный слой получает 4 параметра и выдаёт 7 логитов
-        self.fc5     = nn.Linear(2, 7)
+            nn.Linear(64, 16),
+            nn.BatchNorm1d(16),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Dropout(p=0.2),
+        )
+        self.classifier = nn.Linear(16, num_classes)
 
     def forward(self, x):
-        # ===== Свёрточная часть =====
-        x = self.act(self.bn1(self.conv1(x)))
+        x = self.features(x)
         x = self.pool(x)
-        x = self.drop_conv(x)
-
-        x = self.act(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        x = self.drop_conv(x)
-
-        x = self.act(self.bn3(self.conv3(x)))
-        x = self.pool(x)
-        x = self.drop_conv(x)
-
-        x = self.adaptive_pool(x)
-        x = torch.flatten(x, 1)  # (batch_size, 4608)
-
-        # ===== Полносвязная часть =====
-        x = self.act(self.bn_fc1(self.fc1(x)))
-        x = self.drop_fc1(x)
-
-        x = self.act(self.bn_fc2(self.fc2(x)))
-        x = self.drop_fc2(x)
-
-        # Добавленный слой 64 → 16
-        x = self.act(self.bn_fc3(self.fc3(x)))
-        x = self.drop_fc3(x)
-
-        # Добавленный слой 16 → 4
-        # x = self.act(self.bn_fc4(self.fc4(x)))
-        # x = self.drop_fc4(x)
-
-        x = self.qnn(x)
-
-        # Финальный логит-слой 4 → 7
-        logits = self.fc5(x)
-        return logits
+        x = self.fc(x)
+        x = self.classifier(x)
+        return x
 
 
 def make_sampler(ds: CrackMultiClassDataset) -> WeightedRandomSampler:
@@ -337,7 +303,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device):
             total_acc += accuracy_from_logits(logits, y)
 
     n = max(len(loader), 1)
-    return {"loss": total_loss / n - 0.75, "acc": total_acc / n}
+    return {"loss": total_loss / n, "acc": total_acc / n}
 
 
 @torch.no_grad()
@@ -357,7 +323,7 @@ def evaluate(model, loader, loss_fn, device):
         total_acc += accuracy_from_logits(logits, y)
 
     n = max(len(loader), 1)
-    return {"loss": total_loss / n - 0.75, "acc": total_acc / n}
+    return {"loss": total_loss / n, "acc": total_acc / n}
 
 
 def main():
@@ -366,11 +332,10 @@ def main():
     parser.add_argument("--train-parquet", type=str, default="train.parquet")
     parser.add_argument("--test-parquet", type=str, default="test.parquet")
     parser.add_argument("--image-size", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num-classes", type=int, default=5)
-    parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--save-path", type=str, default="best_crack_multiclass_classifier.pth")
 
     args = parser.parse_args()
@@ -420,21 +385,14 @@ def main():
     model = CrackClassifier(
         in_channels=3,
         num_classes=args.num_classes,
-        base_channels=args.base_channels,
     ).to(device)
 
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+    loss_fn = nn.CrossEntropyLoss()
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=1e-4,
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=2,
     )
 
     best_val_loss = float("inf")
@@ -448,8 +406,6 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_metrics = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
         val_metrics = evaluate(model, test_loader, loss_fn, device)
-
-        scheduler.step(val_metrics["loss"])
 
         history["train_loss"].append(train_metrics["loss"])
         history["val_loss"].append(val_metrics["loss"])
@@ -473,7 +429,6 @@ def main():
                     "num_classes": args.num_classes,
                     "image_size": args.image_size,
                     "thresholds": thresholds,
-                    "base_channels": args.base_channels,
                 },
                 args.save_path,
             )
